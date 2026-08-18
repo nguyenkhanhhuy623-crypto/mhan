@@ -4,8 +4,92 @@
     Service by Luarmor.net
     Compiled by: Flazhy
     Copyright © 2022-2026 Quantum Onyx Team - All Rights Reserved.
-    -- MODIFIED: key verification bypassed (any key accepted)
+    -- MODIFIED: key verification bypassed (any key accepted + child script SDK patched)
 ]]
+
+-- ====== PRE-LOAD: spoof Luarmor globals & hook SDK before any script runs ======
+do
+    local function deep_set(tbl, key, val)
+        if type(tbl) ~= "table" then return end
+        tbl[key] = val
+        local mt = getmetatable and getmetatable(tbl)
+        if mt and type(mt) == "table" then mt[key] = val end
+    end
+
+    local function spoof_all_envs(key, val)
+        local envs = { getgenv and getgenv(), _G, shared }
+        for _, e in ipairs(envs) do deep_set(e, key, val) end
+        pcall(function()
+            if type(getrenv) == "function" then deep_set(getrenv(), key, val) end
+        end)
+    end
+
+    -- Fake Luarmor SDK check_key — always returns KEY_VALID with lifetime data
+    local fake_data = {
+        auth_expire = 0,
+        note = "bypass",
+        total_executions = "∞",
+        hwid = "bypass",
+    }
+    local function fake_check_key(k)
+        return { code = "KEY_VALID", message = "Key valid", data = fake_data }
+    end
+    local fake_status_obj = setmetatable({
+        code = "KEY_VALID", message = "Key valid", data = fake_data,
+        -- emulate Luarmor status methods
+    }, {
+        __index = function(_, k)
+            if k == "valid" then return true end
+            if k == "expired" then return false end
+            if k == "banned" then return false end
+            return nil
+        end
+    })
+    -- Make fake_check_key return a "status" object that behaves like Luarmor status
+    setmetatable(fake_check_key, { __call = function(_, _) return fake_status_obj end })
+
+    -- Spoof globals some Luarmor-protected scripts probe
+    spoof_all_envs("LRM_IsUserPremium", true)
+    spoof_all_envs("LRM_IsUserFree", false)
+    spoof_all_envs("LRM_key", "BYPASS_KEY_LIFETIME")
+    spoof_all_envs("script_key", "BYPASS_KEY_LIFETIME")
+    spoof_all_envs("key", "BYPASS_KEY_LIFETIME")
+    spoof_all_envs("key_expire", 0)
+    spoof_all_envs("key_note", "bypass")
+    spoof_all_envs("key_executions", "∞")
+
+    -- Hook Luarmor SDK loader (some scripts load it on their own too)
+    local original_httpget
+    pcall(function() original_httpget = game.HttpGet end)
+    -- Note: we don't replace HttpGet globally (would break script loading);
+    -- instead, we wrap loadstring for SDK URL detection
+    local original_loadstring = loadstring
+    if original_loadstring then
+        _G.loadstring = function(code, ...)
+            local fn = original_loadstring(code, ...)
+            if not fn then return fn end
+            -- Detect if this loadstring contains Luarmor SDK and patch it
+            if type(code) == "string" and code:find("LuarmorAPI") and code:find("check_key") then
+                return original_loadstring(
+                    "local _orig = ...\n" ..
+                    "local f = _orig and (loadstring or load)(...)\n" ..
+                    "if type(f) == 'function' then\n" ..
+                    "  return setmetatable({}, { __index = function(t, k)\n" ..
+                    "    if k == 'check_key' then\n" ..
+                    "      return function(_, _) return setmetatable({code='KEY_VALID', message='Key valid', data={auth_expire=0, note='bypass', total_executions='\\xe2\\x88\\x9e'}}, {__index=function(_,x) if x=='valid' then return true elseif x=='expired' or x=='banned' then return false end end}) end\n" ..
+                    "    end\n" ..
+                    "    return rawget(t, k) or f[k]\n" ..
+                    "  end, __newindex = function(t,k,v) rawset(t,k,v); pcall(function() f[k]=v end) end, __call = function(_,...) return f(...) end})\n" ..
+                    "end\n" ..
+                    "return f\n",
+                    code
+                )(code, ...)
+            end
+            return fn
+        end
+    end
+end
+-- ====== END PRE-LOAD ======
 
 local Directory = "https://raw.githubusercontent.com/flazhy/QuantumOnyx/refs/heads/main/Games"
 local Api = "https://api.luarmor.net/files/v4/loaders"
@@ -138,7 +222,14 @@ local function LoadScript(tier, key)
     if not tbl then return end
     local url = tbl[gameId]
     if not url then warn("[Quantum Onyx] No " .. tier .. " script for GameId: " .. tostring(gameId)) return end
-    if tier == "Premium" and key then apply_script_key(key) end
+    if tier == "Premium" and key then
+        apply_script_key(key)
+        -- Re-spoof after apply to be sure (some loaders overwrite)
+        getgenv().LRM_IsUserPremium = true
+        getgenv().LRM_IsUserFree = false
+        getgenv().key_expire = 0
+        getgenv().key_executions = "∞"
+    end
     local ok, err = pcall(function() loadstring(game:HttpGet(url))() end)
     if not ok then warn("[Quantum Onyx] Error: " .. tostring(err)) end
 end
